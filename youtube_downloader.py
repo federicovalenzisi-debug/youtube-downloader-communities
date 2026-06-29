@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-__version__ = "1.5"
+__version__ = "1.6"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -57,13 +57,17 @@ YOUTUBE_FORMAT = "bestvideo+bestaudio/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
 # Different YouTube "player clients" expose different format ladders for the SAME
-# video, and which one has the highest resolution varies per video and per IP
-# (e.g. for one video: web=360p, web_safari=1080p, tv_embedded=4K). Pooling them
-# in a single request makes yt-dlp drop the top formats, so instead we probe each
-# of these one by one, see which actually offers the highest resolution, and
-# download from that one. Mobile clients are last-resort just to guarantee a file.
-YOUTUBE_QUALITY_CLIENTS = ["tv_embedded", "web_safari", "web"]
-YOUTUBE_FALLBACK_CLIENTS = ["mweb", "android", "ios"]
+# video, and which one has the highest resolution varies per video AND per attempt
+# (from Colab's datacenter IP, YouTube rate-limits and sometimes serves only 360p
+# for a video that really is 1080p/4K). So we don't trust a single try: we probe
+# every client over several rounds, always keep the highest-resolution file we
+# managed to download, and pause between rounds to dodge the rate limit. Slow but
+# it gets the maximum quality "at all costs".
+YOUTUBE_QUALITY_CLIENTS = ["tv_embedded", "web_safari", "web", "android_vr", "mweb", "tv"]
+YOUTUBE_FALLBACK_CLIENTS = ["android", "ios"]
+MAX_QUALITY_ROUNDS = 4          # how many full passes over all clients
+ROUND_COOLDOWN_SECONDS = 6      # wait between rounds so YouTube stops throttling
+PER_CLIENT_PAUSE_SECONDS = 1.5  # small gap between client requests
 
 
 @dataclass
@@ -453,14 +457,42 @@ def _ydl_opts(player_clients: list[str], video_folder: Path, logger: _QuietLogge
     }
 
 
+def _probe_client_max(yt_dlp_mod, video_url: str, client: str,
+                      attempt_dir: Path, logger: _QuietLogger) -> tuple[int, str]:
+    """Ask one client which formats it can see. Returns (max_height, last_error)."""
+    try:
+        with yt_dlp_mod.YoutubeDL(_ydl_opts([client], attempt_dir, logger)) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+        return _max_height((info or {}).get("formats")) or 0, ""
+    except Exception as exc:
+        return 0, (logger.last_error or str(exc))
+
+
+def _download_with_client(yt_dlp_mod, video_url: str, client: str,
+                          attempt_dir: Path, logger: _QuietLogger) -> tuple[Path | None, int, str]:
+    """Download with one client into attempt_dir. Returns (file, height, error)."""
+    try:
+        for leftover in attempt_dir.glob("video.*"):
+            leftover.unlink(missing_ok=True)
+        with yt_dlp_mod.YoutubeDL(_ydl_opts([client], attempt_dir, logger)) as ydl:
+            ydl.extract_info(video_url, download=True)
+        files = [f for f in attempt_dir.glob("video.*") if f.suffix.lower() != ".jpg"]
+        if not files:
+            raise RuntimeError("yt-dlp did not produce an output file.")
+        return files[0], (get_video_height(files[0]) or 0), ""
+    except Exception as exc:
+        return None, 0, (logger.last_error or str(exc))
+
+
 def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
     """Download one YouTube video at the highest resolution we can actually get.
 
-    Strategy ("max quality at all costs"): probe each quality client to see which
-    one offers the highest resolution for THIS video, then download from the best
-    one. If a download fails, fall through to the next-best client and finally to
-    the mobile clients just to guarantee a file. Also reports the resolution
-    available on YouTube vs. the one actually downloaded.
+    "Max quality at all costs": YouTube throttles Colab's datacenter IP unevenly,
+    so a single try can grab only 360p of a 1080p/4K video. We therefore run
+    several rounds: each round probes every client, downloads from any client that
+    can beat the best file we already have, and always keeps the highest-resolution
+    result. Pauses between rounds let the rate limit cool down. It is slow on
+    purpose. Reports the best resolution YouTube ever exposed vs. what we got.
     """
     video_folder.mkdir(parents=True, exist_ok=True)
     status = "failed"
@@ -468,8 +500,6 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
     video_filename = "video.mp4"
     video_path = video_folder / video_filename
     file_size = ""
-    available_height: int | None = None
-    downloaded_height: int | None = None
 
     try:
         import yt_dlp
@@ -485,53 +515,67 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
         }
 
     logger = _QuietLogger()
+    all_clients = YOUTUBE_QUALITY_CLIENTS + [
+        c for c in YOUTUBE_FALLBACK_CLIENTS if c not in YOUTUBE_QUALITY_CLIENTS
+    ]
+    attempt_dir = video_folder / "_attempt"
+    attempt_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) Probe the quality clients to learn each one's best resolution.
-    probed: list[tuple[int, str]] = []  # (max_height, client)
-    for client in YOUTUBE_QUALITY_CLIENTS:
-        try:
-            with yt_dlp.YoutubeDL(_ydl_opts([client], video_folder, logger)) as ydl:
-                info = ydl.extract_info(video.url, download=False)
-            height = _max_height((info or {}).get("formats")) or 0
-            if height:
-                probed.append((height, client))
-        except Exception as exc:
-            error_message = logger.last_error or str(exc)
+    true_max = 0          # best resolution any client ever exposed (the real max)
+    best_height = 0       # best resolution we actually downloaded
+    best_file: Path | None = None
 
-    if probed:
-        available_height = max(h for h, _ in probed)
+    for round_idx in range(MAX_QUALITY_ROUNDS):
+        max_grew = False
 
-    # Download order: quality clients sorted by best resolution first, then the
-    # mobile fallbacks (which usually still download when the others are blocked).
-    download_order = [c for _, c in sorted(probed, reverse=True)]
-    download_order += [c for c in YOUTUBE_FALLBACK_CLIENTS if c not in download_order]
+        # Probe every client this round to (re)discover the true maximum.
+        probed: list[tuple[int, str]] = []
+        for client in all_clients:
+            height, err = _probe_client_max(yt_dlp, video.url, client, attempt_dir, logger)
+            if err:
+                error_message = err
+            probed.append((height, client))
+            if height > true_max:
+                true_max, max_grew = height, True
+            time.sleep(PER_CLIENT_PAUSE_SECONDS)
 
-    # 2) Try to actually download, best client first.
-    for client in download_order:
-        try:
-            for leftover in video_folder.glob("video.*"):
-                if leftover.suffix.lower() != ".jpg":
-                    leftover.unlink(missing_ok=True)
+        # Download from clients that could beat what we already have (best first).
+        for height, client in sorted(probed, reverse=True):
+            if height == 0 or height <= best_height:
+                continue
+            cand, cand_height, err = _download_with_client(
+                yt_dlp, video.url, client, attempt_dir, logger
+            )
+            if err:
+                error_message = err
+            if cand and cand_height > best_height:
+                # Promote this better file to the real folder, replacing the old one.
+                for old in video_folder.glob("video.*"):
+                    if old.suffix.lower() != ".jpg":
+                        old.unlink(missing_ok=True)
+                dest = video_folder / cand.name
+                cand.replace(dest)
+                best_file, best_height = dest, cand_height
+            time.sleep(PER_CLIENT_PAUSE_SECONDS)
+            if best_height >= true_max and best_height > 0:
+                break
 
-            with yt_dlp.YoutubeDL(_ydl_opts([client], video_folder, logger)) as ydl:
-                info = ydl.extract_info(video.url, download=True)
+        # Stop early only when we are confident we already have the maximum.
+        if best_height >= 2160:
+            break  # 4K — there is nothing higher to chase
+        if best_height >= true_max and best_height > 0 and not max_grew and round_idx >= 1:
+            break  # best matches the discovered max and the max stopped growing
+        if round_idx < MAX_QUALITY_ROUNDS - 1:
+            time.sleep(ROUND_COOLDOWN_SECONDS)
 
-            downloaded_files = sorted(video_folder.glob("video.*"))
-            downloaded_files = [f for f in downloaded_files if f.suffix.lower() != ".jpg"]
-            if not downloaded_files:
-                raise RuntimeError("yt-dlp did not produce an output file.")
+    shutil.rmtree(attempt_dir, ignore_errors=True)
 
-            video_path = downloaded_files[0]
-            video_filename = video_path.name
-            file_size = video_path.stat().st_size
-            downloaded_height = get_video_height(video_path) or (info or {}).get("height")
-            # If we never managed to probe, at least report this client's max.
-            available_height = max(available_height or 0, _max_height((info or {}).get("formats")) or 0) or None
-            status = "downloaded"
-            error_message = ""
-            break
-        except Exception as exc:
-            error_message = logger.last_error or str(exc)
+    if best_file and best_file.exists():
+        status = "downloaded"
+        video_path = best_file
+        video_filename = best_file.name
+        file_size = best_file.stat().st_size
+        error_message = ""
 
     return {
         "video_filename": video_filename,
@@ -539,8 +583,8 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
         "video_file_size": file_size,
         "download_status": status,
         "error_message": _clean_error(error_message) if status != "downloaded" else "",
-        "available_height": available_height,
-        "downloaded_height": downloaded_height,
+        "available_height": true_max or None,
+        "downloaded_height": best_height or None,
     }
 
 
