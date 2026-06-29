@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import re
 import shutil
@@ -31,8 +32,15 @@ from bs4 import BeautifulSoup, Tag
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Print Spanish text / symbols safely on Windows consoles too (Colab is already UTF-8).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
-__version__ = "1.3"
+
+__version__ = "1.4"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -350,6 +358,7 @@ def deduplicate_videos(videos: list[VideoCandidate]) -> list[VideoCandidate]:
 # Naming
 # --------------------------------------------------------------------------- #
 def sanitize_folder_name(name: str) -> str:
+    name = html.unescape(name or "")
     name = re.sub(r'[<>:"/\\|?*]+', " ", name)
     name = re.sub(r"\s+", " ", name).strip().rstrip(".")
     return name or "Video"
@@ -380,14 +389,67 @@ def community_folder_name(html: str, page_url: str) -> str:
 # --------------------------------------------------------------------------- #
 # Download + screenshot
 # --------------------------------------------------------------------------- #
+class _QuietLogger:
+    """Swallow yt-dlp's own output so failed retry attempts don't print scary
+    ERROR lines. We keep only the last error to summarize it ourselves."""
+
+    def __init__(self) -> None:
+        self.last_error = ""
+
+    def debug(self, msg: str) -> None:  # noqa: D401
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        pass
+
+    def error(self, msg: str) -> None:
+        text = str(msg).strip()
+        if text:
+            self.last_error = text
+
+
+def _clean_error(message: str) -> str:
+    """Shorten a yt-dlp error into something a non-technical user can read."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", message or "").strip()
+    text = re.sub(r"^ERROR:\s*", "", text)
+    lowered = text.lower()
+    if "not available" in lowered or "video unavailable" in lowered:
+        return "el video ya no está disponible en YouTube"
+    if "private" in lowered:
+        return "el video es privado"
+    if "403" in lowered or "forbidden" in lowered:
+        return "YouTube bloqueó la descarga (probá de nuevo)"
+    if "requested format is not available" in lowered:
+        return "no se encontró un formato descargable"
+    return text[:140] if text else "error desconocido"
+
+
+def _max_height(formats: list[dict] | None) -> int | None:
+    """Best video height available among yt-dlp formats."""
+    if not formats:
+        return None
+    heights = [f.get("height") or 0 for f in formats if (f.get("vcodec") or "none") != "none"]
+    top = max(heights, default=0)
+    return top or None
+
+
 def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
-    """Download one YouTube video with yt-dlp in the best available quality."""
+    """Download one YouTube video with yt-dlp in the best available quality.
+
+    Returns a dict that also reports the resolution available on YouTube and the
+    resolution actually downloaded, so the summary can show them clearly.
+    """
     video_folder.mkdir(parents=True, exist_ok=True)
     status = "failed"
     error_message = ""
     video_filename = "video.mp4"
     video_path = video_folder / video_filename
     file_size = ""
+    available_height: int | None = None
+    downloaded_height: int | None = None
 
     try:
         import yt_dlp
@@ -398,11 +460,15 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             "video_file_size": file_size,
             "download_status": "failed",
             "error_message": "yt-dlp is not installed. Run: pip install yt-dlp",
+            "available_height": None,
+            "downloaded_height": None,
         }
+
+    logger = _QuietLogger()
 
     # Try each player-client group until one succeeds. This works around
     # YouTube blocking Colab/datacenter IPs on the default "web" client.
-    for attempt, player_clients in enumerate(YOUTUBE_CLIENT_FALLBACKS, start=1):
+    for player_clients in YOUTUBE_CLIENT_FALLBACKS:
         ydl_opts = {
             "format": YOUTUBE_FORMAT,
             "format_sort": ["res", "fps", "vcodec:h264", "br"],
@@ -411,6 +477,8 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "noprogress": True,
+            "logger": logger,
             "retries": 5,
             "fragment_retries": 5,
             "extractor_retries": 3,
@@ -424,7 +492,9 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
                     leftover.unlink(missing_ok=True)
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([video.url])
+                info = ydl.extract_info(video.url, download=True)
+
+            available_height = _max_height((info or {}).get("formats"))
 
             downloaded_files = sorted(video_folder.glob("video.*"))
             downloaded_files = [f for f in downloaded_files if f.suffix.lower() != ".jpg"]
@@ -434,27 +504,21 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             video_path = downloaded_files[0]
             video_filename = video_path.name
             file_size = video_path.stat().st_size
+            downloaded_height = get_video_height(video_path) or (info or {}).get("height")
             status = "downloaded"
             error_message = ""
             break
         except Exception as exc:
-            error_message = str(exc)
-            if attempt < len(YOUTUBE_CLIENT_FALLBACKS):
-                print(
-                    f"  Retry {video.url} with another player client "
-                    f"({'/'.join(YOUTUBE_CLIENT_FALLBACKS[attempt])})...",
-                    file=sys.stderr,
-                )
-
-    if status != "downloaded":
-        print(f"Failed YouTube video: {video.url} ({error_message})", file=sys.stderr)
+            error_message = logger.last_error or str(exc)
 
     return {
         "video_filename": video_filename,
         "video_path": str(video_path),
         "video_file_size": file_size,
         "download_status": status,
-        "error_message": error_message,
+        "error_message": _clean_error(error_message) if status != "downloaded" else "",
+        "available_height": available_height,
+        "downloaded_height": downloaded_height,
     }
 
 
@@ -476,6 +540,26 @@ def get_video_duration_seconds(video_path: Path) -> float | None:
             capture_output=True, text=True, check=True, timeout=60,
         )
         return float(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def get_video_height(video_path: Path) -> int | None:
+    """Actual vertical resolution (e.g. 1080) of the downloaded file."""
+    if not ffmpeg_available():
+        return None
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=height",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True, text=True, check=True, timeout=60,
+        )
+        return int(result.stdout.strip().splitlines()[0])
     except Exception:
         return None
 
@@ -512,6 +596,15 @@ def create_video_screenshot(video_path: Path, screenshot_path: Path, target_seco
 # --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
+def res_label(height: int | None) -> str:
+    """Human label for a vertical resolution, e.g. 1080 -> '1080p'."""
+    if not height:
+        return "desconocida"
+    if height >= 2160:
+        return f"{height}p (4K)"
+    return f"{height}p"
+
+
 def process_community(
     gallery_url: str,
     community_name: str,
@@ -522,12 +615,12 @@ def process_community(
     make_screenshots: bool = True,
 ) -> CommunityResult:
     """Find and download all YouTube videos for one community (Gallery + Home)."""
-    print(f"\nScanning gallery: {gallery_url}")
+    print(f"\nRevisando galería: {gallery_url}")
     gallery_html = fetch_html(gallery_url, session=session)
     gallery_videos = deduplicate_videos(extract_youtube_videos(gallery_html, page_source="Gallery"))
 
     if use_playwright and not gallery_videos and page_suggests_videos(gallery_html):
-        print("Trying Playwright fallback for gallery videos...")
+        print("Reintentando con navegador (Playwright) para la galería...")
         rendered = render_with_playwright_if_needed(gallery_url)
         if rendered:
             rendered_videos = deduplicate_videos(extract_youtube_videos(rendered, page_source="Gallery"))
@@ -540,11 +633,11 @@ def process_community(
     home_videos: list[VideoCandidate] = []
     home_skipped = 0
     if scan_home:
-        print(f"Scanning home page: {home_url}")
+        print(f"Revisando página principal: {home_url}")
         try:
             home_videos = fetch_page_youtube_videos(home_url, "Home", session, use_playwright)
         except Exception as exc:
-            print(f"Warning: could not fetch home page {home_url}: {exc}", file=sys.stderr)
+            print(f"Aviso: no se pudo leer la página principal {home_url}: {exc}", file=sys.stderr)
         gallery_keys = {youtube_key(v.url) for v in gallery_videos}
         filtered = []
         for video in home_videos:
@@ -555,9 +648,9 @@ def process_community(
         home_videos = filtered
 
     all_videos = gallery_videos + home_videos
-    print(f"YouTube videos found: {len(all_videos)} (Gallery: {len(gallery_videos)}, Home: {len(home_videos)})")
+    print(f"Videos de YouTube encontrados: {len(all_videos)} (Galería: {len(gallery_videos)}, Principal: {len(home_videos)})")
     if home_skipped:
-        print(f"Skipped {home_skipped} home video(s) already found in gallery.")
+        print(f"Se omitieron {home_skipped} video(s) de la principal que ya estaban en la galería.")
 
     community_folder = output_root / sanitize_folder_name(resolved_name)
     community_folder.mkdir(parents=True, exist_ok=True)
@@ -575,7 +668,8 @@ def process_community(
         display_name = video_display_name(video)
         folder_name = f"{index:03d} - {display_name}"
         video_folder = community_folder / folder_name
-        print(f"  [{index}/{len(all_videos)}] {video.page_source}: {display_name}")
+        print(f"  [{index}/{len(all_videos)}] {display_name}")
+        print("        Descargando...")
 
         download = download_youtube_video(video, video_folder)
 
@@ -585,10 +679,21 @@ def process_community(
                 Path(download["video_path"]), video_folder / "screenshot.jpg"
             )
 
+        available_h = download["available_height"]
+        downloaded_h = download["downloaded_height"]
         if download["download_status"] == "downloaded":
             result.videos_downloaded += 1
+            if available_h and downloaded_h and downloaded_h < available_h - 1:
+                print(
+                    f"        ⚠ Descargado en {res_label(downloaded_h)} "
+                    f"(en YouTube había {res_label(available_h)}; no se pudo bajar la máxima)"
+                )
+            else:
+                extra = f" (lo máximo en YouTube)" if available_h else ""
+                print(f"        ✔ Descargado en {res_label(downloaded_h)}{extra}")
         else:
             result.videos_failed += 1
+            print(f"        ✘ No se pudo descargar: {download['error_message']}")
 
         result.rows.append(
             {
@@ -600,6 +705,8 @@ def process_community(
                 "youtube_key": youtube_key(video.url),
                 "video_filename": download["video_filename"],
                 "video_file_size": download["video_file_size"],
+                "youtube_resolution": res_label(available_h) if available_h else "",
+                "downloaded_resolution": res_label(downloaded_h) if downloaded_h else "",
                 "download_status": download["download_status"],
                 "error_message": download["error_message"],
                 "screenshot_status": screenshot["status"],
@@ -616,7 +723,8 @@ def write_community_manifest(community_folder: Path, rows: list[dict]) -> Path:
     manifest_path = community_folder / "manifest.csv"
     fieldnames = [
         "index", "source_page", "video_name", "video_folder", "youtube_url",
-        "youtube_key", "video_filename", "video_file_size", "download_status",
+        "youtube_key", "video_filename", "video_file_size",
+        "youtube_resolution", "downloaded_resolution", "download_status",
         "error_message", "screenshot_status", "screenshot_error",
     ]
     with manifest_path.open("w", encoding="utf-8", newline="") as file:
@@ -674,7 +782,7 @@ def download_from_entries(
 
     results: list[CommunityResult] = []
     for position, entry in enumerate(entries, start=1):
-        print(f"\n=== Community {position}/{len(entries)} ===")
+        print(f"\n=== Comunidad {position}/{len(entries)} ===")
         try:
             result = process_community(
                 gallery_url=entry.url,
@@ -686,7 +794,7 @@ def download_from_entries(
                 make_screenshots=make_screenshots,
             )
         except Exception as exc:
-            print(f"Failed to process {entry.url}: {exc}", file=sys.stderr)
+            print(f"No se pudo procesar {entry.url}: {exc}", file=sys.stderr)
             result = CommunityResult(
                 community_name=entry.community_name or entry.url,
                 gallery_url=entry.url,
@@ -704,13 +812,38 @@ def print_summary(results: list[CommunityResult], output_root: Path) -> None:
     total_found = sum(r.videos_found for r in results)
     total_downloaded = sum(r.videos_downloaded for r in results)
     total_failed = sum(r.videos_failed for r in results)
-    print("\n================ Summary ================")
-    print(f"Communities processed: {len(results)}")
-    print(f"YouTube videos found:  {total_found}")
-    print(f"Downloaded:            {total_downloaded}")
-    print(f"Failed:                {total_failed}")
-    print(f"Output folder:         {output_root.resolve()}")
-    print("=========================================")
+
+    print("\n=================== RESUMEN ===================")
+    for result in results:
+        print(f"\n{result.community_name}")
+        if not result.rows:
+            print("  (no se encontraron videos de YouTube)")
+            continue
+        for row in result.rows:
+            name = row["video_name"]
+            if row["download_status"] == "downloaded":
+                yt = row["youtube_resolution"] or "?"
+                got = row["downloaded_resolution"] or "?"
+                low = (
+                    row["downloaded_resolution"]
+                    and row["youtube_resolution"]
+                    and row["downloaded_resolution"] != row["youtube_resolution"]
+                )
+                mark = "⚠" if low else "✔"
+                note = "   <- no se pudo bajar la máxima" if low else ""
+                print(f"  {mark} {name}")
+                print(f"      YouTube: {yt}   |   Descargado: {got}{note}")
+            else:
+                print(f"  ✘ {name}")
+                print(f"      No se descargó: {row['error_message']}")
+
+    print("\n----------------------------------------------")
+    print(f"Comunidades procesadas: {len(results)}")
+    print(f"Videos encontrados:     {total_found}")
+    print(f"Descargados:            {total_downloaded}")
+    print(f"Con problemas:          {total_failed}")
+    print(f"Carpeta de salida:      {output_root.resolve()}")
+    print("==============================================")
 
 
 # --------------------------------------------------------------------------- #
