@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-__version__ = "1.4"
+__version__ = "1.5"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -56,16 +56,14 @@ YOUTUBE_ID_PATTERN = re.compile(r"^[\w-]{11}$")
 YOUTUBE_FORMAT = "bestvideo+bestaudio/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
-# Player-client groups tried in order. On Google Colab (datacenter IPs) YouTube
-# only serves the full 1080p/4K formats to the "web" clients when a PO token is
-# provided (the Colab notebook auto-starts a PO-token server for this). The
-# mobile clients work without a token but cap at ~360p for many of these videos,
-# so they are the last resort just to guarantee the download succeeds.
-YOUTUBE_CLIENT_FALLBACKS = [
-    ["web", "web_safari"],           # full quality (1080p/4K); needs a PO token on datacenter IPs
-    ["tv_embedded"],                 # full quality without a PO token where available
-    ["mweb", "android", "ios"],      # last resort: always downloads but may be 360p
-]
+# Different YouTube "player clients" expose different format ladders for the SAME
+# video, and which one has the highest resolution varies per video and per IP
+# (e.g. for one video: web=360p, web_safari=1080p, tv_embedded=4K). Pooling them
+# in a single request makes yt-dlp drop the top formats, so instead we probe each
+# of these one by one, see which actually offers the highest resolution, and
+# download from that one. Mobile clients are last-resort just to guarantee a file.
+YOUTUBE_QUALITY_CLIENTS = ["tv_embedded", "web_safari", "web"]
+YOUTUBE_FALLBACK_CLIENTS = ["mweb", "android", "ios"]
 
 
 @dataclass
@@ -417,14 +415,14 @@ def _clean_error(message: str) -> str:
     text = re.sub(r"^ERROR:\s*", "", text)
     lowered = text.lower()
     if "not available" in lowered or "video unavailable" in lowered:
-        return "el video ya no está disponible en YouTube"
+        return "the video is no longer available on YouTube"
     if "private" in lowered:
-        return "el video es privado"
+        return "the video is private"
     if "403" in lowered or "forbidden" in lowered:
-        return "YouTube bloqueó la descarga (probá de nuevo)"
+        return "YouTube blocked the download (try again)"
     if "requested format is not available" in lowered:
-        return "no se encontró un formato descargable"
-    return text[:140] if text else "error desconocido"
+        return "no downloadable format was found"
+    return text[:140] if text else "unknown error"
 
 
 def _max_height(formats: list[dict] | None) -> int | None:
@@ -436,11 +434,33 @@ def _max_height(formats: list[dict] | None) -> int | None:
     return top or None
 
 
-def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
-    """Download one YouTube video with yt-dlp in the best available quality.
+def _ydl_opts(player_clients: list[str], video_folder: Path, logger: _QuietLogger) -> dict:
+    return {
+        "format": YOUTUBE_FORMAT,
+        "format_sort": ["res", "fps", "vcodec:h264", "br"],
+        "outtmpl": str(video_folder / "video.%(ext)s"),
+        "merge_output_format": "mp4/mkv",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "noprogress": True,
+        "logger": logger,
+        "retries": 5,
+        "fragment_retries": 5,
+        "extractor_retries": 3,
+        "extractor_args": {"youtube": {"player_client": player_clients}},
+        "http_headers": {"User-Agent": USER_AGENT},
+    }
 
-    Returns a dict that also reports the resolution available on YouTube and the
-    resolution actually downloaded, so the summary can show them clearly.
+
+def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
+    """Download one YouTube video at the highest resolution we can actually get.
+
+    Strategy ("max quality at all costs"): probe each quality client to see which
+    one offers the highest resolution for THIS video, then download from the best
+    one. If a download fails, fall through to the next-best client and finally to
+    the mobile clients just to guarantee a file. Also reports the resolution
+    available on YouTube vs. the one actually downloaded.
     """
     video_folder.mkdir(parents=True, exist_ok=True)
     status = "failed"
@@ -466,35 +486,35 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
 
     logger = _QuietLogger()
 
-    # Try each player-client group until one succeeds. This works around
-    # YouTube blocking Colab/datacenter IPs on the default "web" client.
-    for player_clients in YOUTUBE_CLIENT_FALLBACKS:
-        ydl_opts = {
-            "format": YOUTUBE_FORMAT,
-            "format_sort": ["res", "fps", "vcodec:h264", "br"],
-            "outtmpl": str(video_folder / "video.%(ext)s"),
-            "merge_output_format": "mp4/mkv",
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "noprogress": True,
-            "logger": logger,
-            "retries": 5,
-            "fragment_retries": 5,
-            "extractor_retries": 3,
-            "extractor_args": {"youtube": {"player_client": player_clients}},
-            "http_headers": {"User-Agent": USER_AGENT},
-        }
+    # 1) Probe the quality clients to learn each one's best resolution.
+    probed: list[tuple[int, str]] = []  # (max_height, client)
+    for client in YOUTUBE_QUALITY_CLIENTS:
         try:
-            # Remove leftovers from a failed previous attempt before retrying.
+            with yt_dlp.YoutubeDL(_ydl_opts([client], video_folder, logger)) as ydl:
+                info = ydl.extract_info(video.url, download=False)
+            height = _max_height((info or {}).get("formats")) or 0
+            if height:
+                probed.append((height, client))
+        except Exception as exc:
+            error_message = logger.last_error or str(exc)
+
+    if probed:
+        available_height = max(h for h, _ in probed)
+
+    # Download order: quality clients sorted by best resolution first, then the
+    # mobile fallbacks (which usually still download when the others are blocked).
+    download_order = [c for _, c in sorted(probed, reverse=True)]
+    download_order += [c for c in YOUTUBE_FALLBACK_CLIENTS if c not in download_order]
+
+    # 2) Try to actually download, best client first.
+    for client in download_order:
+        try:
             for leftover in video_folder.glob("video.*"):
                 if leftover.suffix.lower() != ".jpg":
                     leftover.unlink(missing_ok=True)
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with yt_dlp.YoutubeDL(_ydl_opts([client], video_folder, logger)) as ydl:
                 info = ydl.extract_info(video.url, download=True)
-
-            available_height = _max_height((info or {}).get("formats"))
 
             downloaded_files = sorted(video_folder.glob("video.*"))
             downloaded_files = [f for f in downloaded_files if f.suffix.lower() != ".jpg"]
@@ -505,6 +525,8 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             video_filename = video_path.name
             file_size = video_path.stat().st_size
             downloaded_height = get_video_height(video_path) or (info or {}).get("height")
+            # If we never managed to probe, at least report this client's max.
+            available_height = max(available_height or 0, _max_height((info or {}).get("formats")) or 0) or None
             status = "downloaded"
             error_message = ""
             break
@@ -599,7 +621,7 @@ def create_video_screenshot(video_path: Path, screenshot_path: Path, target_seco
 def res_label(height: int | None) -> str:
     """Human label for a vertical resolution, e.g. 1080 -> '1080p'."""
     if not height:
-        return "desconocida"
+        return "unknown"
     if height >= 2160:
         return f"{height}p (4K)"
     return f"{height}p"
@@ -615,12 +637,12 @@ def process_community(
     make_screenshots: bool = True,
 ) -> CommunityResult:
     """Find and download all YouTube videos for one community (Gallery + Home)."""
-    print(f"\nRevisando galería: {gallery_url}")
+    print(f"\nScanning gallery: {gallery_url}")
     gallery_html = fetch_html(gallery_url, session=session)
     gallery_videos = deduplicate_videos(extract_youtube_videos(gallery_html, page_source="Gallery"))
 
     if use_playwright and not gallery_videos and page_suggests_videos(gallery_html):
-        print("Reintentando con navegador (Playwright) para la galería...")
+        print("Retrying with browser (Playwright) for the gallery...")
         rendered = render_with_playwright_if_needed(gallery_url)
         if rendered:
             rendered_videos = deduplicate_videos(extract_youtube_videos(rendered, page_source="Gallery"))
@@ -633,11 +655,11 @@ def process_community(
     home_videos: list[VideoCandidate] = []
     home_skipped = 0
     if scan_home:
-        print(f"Revisando página principal: {home_url}")
+        print(f"Scanning home page: {home_url}")
         try:
             home_videos = fetch_page_youtube_videos(home_url, "Home", session, use_playwright)
         except Exception as exc:
-            print(f"Aviso: no se pudo leer la página principal {home_url}: {exc}", file=sys.stderr)
+            print(f"Warning: could not read home page {home_url}: {exc}", file=sys.stderr)
         gallery_keys = {youtube_key(v.url) for v in gallery_videos}
         filtered = []
         for video in home_videos:
@@ -648,9 +670,9 @@ def process_community(
         home_videos = filtered
 
     all_videos = gallery_videos + home_videos
-    print(f"Videos de YouTube encontrados: {len(all_videos)} (Galería: {len(gallery_videos)}, Principal: {len(home_videos)})")
+    print(f"YouTube videos found: {len(all_videos)} (Gallery: {len(gallery_videos)}, Home: {len(home_videos)})")
     if home_skipped:
-        print(f"Se omitieron {home_skipped} video(s) de la principal que ya estaban en la galería.")
+        print(f"Skipped {home_skipped} home video(s) already found in the gallery.")
 
     community_folder = output_root / sanitize_folder_name(resolved_name)
     community_folder.mkdir(parents=True, exist_ok=True)
@@ -669,7 +691,7 @@ def process_community(
         folder_name = f"{index:03d} - {display_name}"
         video_folder = community_folder / folder_name
         print(f"  [{index}/{len(all_videos)}] {display_name}")
-        print("        Descargando...")
+        print("        Downloading...")
 
         download = download_youtube_video(video, video_folder)
 
@@ -685,15 +707,15 @@ def process_community(
             result.videos_downloaded += 1
             if available_h and downloaded_h and downloaded_h < available_h - 1:
                 print(
-                    f"        ⚠ Descargado en {res_label(downloaded_h)} "
-                    f"(en YouTube había {res_label(available_h)}; no se pudo bajar la máxima)"
+                    f"        ⚠ Downloaded in {res_label(downloaded_h)} "
+                    f"(YouTube had {res_label(available_h)}; couldn't get the maximum)"
                 )
             else:
-                extra = f" (lo máximo en YouTube)" if available_h else ""
-                print(f"        ✔ Descargado en {res_label(downloaded_h)}{extra}")
+                extra = " (the maximum on YouTube)" if available_h else ""
+                print(f"        ✔ Downloaded in {res_label(downloaded_h)}{extra}")
         else:
             result.videos_failed += 1
-            print(f"        ✘ No se pudo descargar: {download['error_message']}")
+            print(f"        ✘ Could not download: {download['error_message']}")
 
         result.rows.append(
             {
@@ -782,7 +804,7 @@ def download_from_entries(
 
     results: list[CommunityResult] = []
     for position, entry in enumerate(entries, start=1):
-        print(f"\n=== Comunidad {position}/{len(entries)} ===")
+        print(f"\n=== Community {position}/{len(entries)} ===")
         try:
             result = process_community(
                 gallery_url=entry.url,
@@ -794,7 +816,7 @@ def download_from_entries(
                 make_screenshots=make_screenshots,
             )
         except Exception as exc:
-            print(f"No se pudo procesar {entry.url}: {exc}", file=sys.stderr)
+            print(f"Could not process {entry.url}: {exc}", file=sys.stderr)
             result = CommunityResult(
                 community_name=entry.community_name or entry.url,
                 gallery_url=entry.url,
@@ -813,11 +835,11 @@ def print_summary(results: list[CommunityResult], output_root: Path) -> None:
     total_downloaded = sum(r.videos_downloaded for r in results)
     total_failed = sum(r.videos_failed for r in results)
 
-    print("\n=================== RESUMEN ===================")
+    print("\n=================== SUMMARY ===================")
     for result in results:
         print(f"\n{result.community_name}")
         if not result.rows:
-            print("  (no se encontraron videos de YouTube)")
+            print("  (no YouTube videos found)")
             continue
         for row in result.rows:
             name = row["video_name"]
@@ -830,19 +852,19 @@ def print_summary(results: list[CommunityResult], output_root: Path) -> None:
                     and row["downloaded_resolution"] != row["youtube_resolution"]
                 )
                 mark = "⚠" if low else "✔"
-                note = "   <- no se pudo bajar la máxima" if low else ""
+                note = "   <- couldn't get the maximum" if low else ""
                 print(f"  {mark} {name}")
-                print(f"      YouTube: {yt}   |   Descargado: {got}{note}")
+                print(f"      YouTube: {yt}   |   Downloaded: {got}{note}")
             else:
                 print(f"  ✘ {name}")
-                print(f"      No se descargó: {row['error_message']}")
+                print(f"      Not downloaded: {row['error_message']}")
 
     print("\n----------------------------------------------")
-    print(f"Comunidades procesadas: {len(results)}")
-    print(f"Videos encontrados:     {total_found}")
-    print(f"Descargados:            {total_downloaded}")
-    print(f"Con problemas:          {total_failed}")
-    print(f"Carpeta de salida:      {output_root.resolve()}")
+    print(f"Communities processed: {len(results)}")
+    print(f"Videos found:          {total_found}")
+    print(f"Downloaded:            {total_downloaded}")
+    print(f"With problems:         {total_failed}")
+    print(f"Output folder:         {output_root.resolve()}")
     print("==============================================")
 
 
