@@ -40,16 +40,23 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 30
 DEFAULT_DOWNLOAD_ROOT = "downloads"
 YOUTUBE_ID_PATTERN = re.compile(r"^[\w-]{11}$")
-YOUTUBE_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+# Maximum quality regardless of codec/container. Forcing ext=mp4 would cap
+# YouTube at 1080p (H.264); 1440p/4K only exist as VP9/AV1 (webm), so we take
+# the best video + best audio and let yt-dlp merge into mp4 (mkv as fallback).
+YOUTUBE_FORMAT = "bestvideo+bestaudio/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
-# Player clients tried in order. Datacenter IPs (like Google Colab) get
-# blocked by YouTube's default "web" client (HTTP 403 / "video not available"),
-# but the TV/iOS/Android clients usually still work, so we try those first.
+# Player-client groups tried in order. There is a tension on Google Colab:
+# datacenter IPs get HTTP 403 / "video not available" on YouTube's default
+# "web" client, but the mobile/android clients that bypass that only expose
+# low-res (360p) formats for many of these videos. tv_embedded and web_safari
+# expose the full 1080p/4K formats AND usually work from datacenter IPs, so we
+# try those first for max quality and fall back to the others only to make sure
+# the video downloads at all.
 YOUTUBE_CLIENT_FALLBACKS = [
-    ["tv", "ios", "android"],
-    ["web_safari", "mweb"],
-    ["web"],
+    ["tv_embedded", "web_safari"],   # full quality (1080p/4K), usually bypass the block
+    ["mweb", "android", "ios"],      # bypass the block but may cap at 360-720p
+    ["web"],                          # full quality, often blocked on datacenter IPs
 ]
 
 
@@ -398,8 +405,9 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
     for attempt, player_clients in enumerate(YOUTUBE_CLIENT_FALLBACKS, start=1):
         ydl_opts = {
             "format": YOUTUBE_FORMAT,
+            "format_sort": ["res", "fps", "vcodec:h264", "br"],
             "outtmpl": str(video_folder / "video.%(ext)s"),
-            "merge_output_format": "mp4",
+            "merge_output_format": "mp4/mkv",
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
