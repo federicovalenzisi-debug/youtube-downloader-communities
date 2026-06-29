@@ -32,6 +32,8 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+__version__ = "1.3"
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
