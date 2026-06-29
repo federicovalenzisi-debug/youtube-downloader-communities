@@ -1,0 +1,5 @@
+# Una comunidad por línea. El nombre después de "|" es opcional.
+# Formato:  URL de la galería | Nombre de la comunidad
+# Las líneas vacías y las que empiezan con # se ignoran.
+
+https://lakehousemanitowoc.seniorlivingnearme.com/gallery | LakeHouse Manitowoc
