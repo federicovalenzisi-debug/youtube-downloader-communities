@@ -23,6 +23,14 @@ instalar Python/FFmpeg. Todo corre en la nube de Google.
 Necesita una cuenta de Google (gratis). La primera celda tarda 1–2 minutos en preparar
 el entorno.
 
+> **Máxima calidad (1080p/4K):** desde Colab, YouTube solo entrega la alta resolución
+> si hay un *PO token*. La primera celda levanta sola un pequeño servidor que lo genera
+> (opción `MAXIMA_CALIDAD`, activada por defecto), así que no hay que hacer nada. Si ese
+> servidor no llega a iniciar, los videos igual se descargan, pero pueden bajar en baja
+> resolución (~360p). En ese caso, volvé a ejecutar la primera celda. Si cambiás el
+> notebook, acordate de **Entorno de ejecución → Desconectar y eliminar entorno** antes
+> de volver a ejecutarlo, para que Colab tome la versión nueva.
+
 ### Para vos (publicarlo una sola vez)
 
 El notebook es `YouTube_Downloader_Colab.ipynb` y es **autocontenido**: lleva el código

@@ -46,17 +46,15 @@ YOUTUBE_ID_PATTERN = re.compile(r"^[\w-]{11}$")
 YOUTUBE_FORMAT = "bestvideo+bestaudio/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
-# Player-client groups tried in order. There is a tension on Google Colab:
-# datacenter IPs get HTTP 403 / "video not available" on YouTube's default
-# "web" client, but the mobile/android clients that bypass that only expose
-# low-res (360p) formats for many of these videos. tv_embedded and web_safari
-# expose the full 1080p/4K formats AND usually work from datacenter IPs, so we
-# try those first for max quality and fall back to the others only to make sure
-# the video downloads at all.
+# Player-client groups tried in order. On Google Colab (datacenter IPs) YouTube
+# only serves the full 1080p/4K formats to the "web" clients when a PO token is
+# provided (the Colab notebook auto-starts a PO-token server for this). The
+# mobile clients work without a token but cap at ~360p for many of these videos,
+# so they are the last resort just to guarantee the download succeeds.
 YOUTUBE_CLIENT_FALLBACKS = [
-    ["tv_embedded", "web_safari"],   # full quality (1080p/4K), usually bypass the block
-    ["mweb", "android", "ios"],      # bypass the block but may cap at 360-720p
-    ["web"],                          # full quality, often blocked on datacenter IPs
+    ["web", "web_safari"],           # full quality (1080p/4K); needs a PO token on datacenter IPs
+    ["tv_embedded"],                 # full quality without a PO token where available
+    ["mweb", "android", "ios"],      # last resort: always downloads but may be 360p
 ]
 
 
