@@ -43,6 +43,15 @@ YOUTUBE_ID_PATTERN = re.compile(r"^[\w-]{11}$")
 YOUTUBE_FORMAT = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
+# Player clients tried in order. Datacenter IPs (like Google Colab) get
+# blocked by YouTube's default "web" client (HTTP 403 / "video not available"),
+# but the TV/iOS/Android clients usually still work, so we try those first.
+YOUTUBE_CLIENT_FALLBACKS = [
+    ["tv", "ios", "android"],
+    ["web_safari", "mweb"],
+    ["web"],
+]
+
 
 @dataclass
 class LinkEntry:
@@ -384,7 +393,9 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             "error_message": "yt-dlp is not installed. Run: pip install yt-dlp",
         }
 
-    try:
+    # Try each player-client group until one succeeds. This works around
+    # YouTube blocking Colab/datacenter IPs on the default "web" client.
+    for attempt, player_clients in enumerate(YOUTUBE_CLIENT_FALLBACKS, start=1):
         ydl_opts = {
             "format": YOUTUBE_FORMAT,
             "outtmpl": str(video_folder / "video.%(ext)s"),
@@ -392,21 +403,42 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
             "quiet": True,
             "no_warnings": True,
             "noplaylist": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "extractor_retries": 3,
+            "extractor_args": {"youtube": {"player_client": player_clients}},
+            "http_headers": {"User-Agent": USER_AGENT},
         }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video.url])
+        try:
+            # Remove leftovers from a failed previous attempt before retrying.
+            for leftover in video_folder.glob("video.*"):
+                if leftover.suffix.lower() != ".jpg":
+                    leftover.unlink(missing_ok=True)
 
-        downloaded_files = sorted(video_folder.glob("video.*"))
-        downloaded_files = [f for f in downloaded_files if f.suffix.lower() != ".jpg"]
-        if not downloaded_files:
-            raise RuntimeError("yt-dlp did not produce an output file.")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video.url])
 
-        video_path = downloaded_files[0]
-        video_filename = video_path.name
-        file_size = video_path.stat().st_size
-        status = "downloaded"
-    except Exception as exc:
-        error_message = str(exc)
+            downloaded_files = sorted(video_folder.glob("video.*"))
+            downloaded_files = [f for f in downloaded_files if f.suffix.lower() != ".jpg"]
+            if not downloaded_files:
+                raise RuntimeError("yt-dlp did not produce an output file.")
+
+            video_path = downloaded_files[0]
+            video_filename = video_path.name
+            file_size = video_path.stat().st_size
+            status = "downloaded"
+            error_message = ""
+            break
+        except Exception as exc:
+            error_message = str(exc)
+            if attempt < len(YOUTUBE_CLIENT_FALLBACKS):
+                print(
+                    f"  Retry {video.url} with another player client "
+                    f"({'/'.join(YOUTUBE_CLIENT_FALLBACKS[attempt])})...",
+                    file=sys.stderr,
+                )
+
+    if status != "downloaded":
         print(f"Failed YouTube video: {video.url} ({error_message})", file=sys.stderr)
 
     return {
@@ -617,9 +649,18 @@ def download_from_entries(
     use_playwright: bool = True,
     scan_home: bool = True,
     make_screenshots: bool = True,
+    clean: bool = True,
 ) -> list[CommunityResult]:
-    """High-level entry point used by both the CLI and the Colab notebook."""
+    """High-level entry point used by both the CLI and the Colab notebook.
+
+    When clean=True (the default) the output folder is wiped before downloading,
+    so each run's zip only contains the communities from that run. This matters
+    in Colab, where the folder otherwise persists between cell runs and old
+    downloads pile up.
+    """
     output_root = Path(output_root)
+    if clean and output_root.exists():
+        shutil.rmtree(output_root, ignore_errors=True)
     output_root.mkdir(parents=True, exist_ok=True)
     session = create_session()
 
@@ -713,6 +754,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-home", action="store_true", help="Do not scan the Home page, only the given URL.")
     parser.add_argument("--no-playwright", action="store_true", help="Disable Playwright fallback rendering.")
     parser.add_argument("--no-screenshots", action="store_true", help="Do not create video screenshots.")
+    parser.add_argument("--no-clean", action="store_true", help="Keep existing files in the output folder (do not wipe it first).")
     return parser.parse_args()
 
 
@@ -744,6 +786,7 @@ def main() -> int:
         use_playwright=not args.no_playwright,
         scan_home=not args.no_home,
         make_screenshots=not args.no_screenshots,
+        clean=not args.no_clean,
     )
     return 0 if all(r.videos_failed == 0 for r in results) else 1
 
