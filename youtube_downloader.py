@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-__version__ = "1.6"
+__version__ = "1.7"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -50,24 +50,31 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 30
 DEFAULT_DOWNLOAD_ROOT = "downloads"
 YOUTUBE_ID_PATTERN = re.compile(r"^[\w-]{11}$")
-# Maximum quality regardless of codec/container. Forcing ext=mp4 would cap
-# YouTube at 1080p (H.264); 1440p/4K only exist as VP9/AV1 (webm), so we take
-# the best video + best audio and let yt-dlp merge into mp4 (mkv as fallback).
-YOUTUBE_FORMAT = "bestvideo+bestaudio/best"
+# Maximum quality regardless of codec/container. We always take the best video
+# stream (so 1440p/4K VP9/AV1 are never capped), and prefer m4a audio so the
+# common 1080p/720p H.264 case merges into a universally compatible .mp4. When
+# only Opus audio or VP9/AV1 video exists (e.g. real 4K) yt-dlp falls back to the
+# plain best streams and merges into .mkv -- quality is identical, only the
+# container differs.
+YOUTUBE_FORMAT = "bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 
-# Different YouTube "player clients" expose different format ladders for the SAME
-# video, and which one has the highest resolution varies per video AND per attempt
-# (from Colab's datacenter IP, YouTube rate-limits and sometimes serves only 360p
-# for a video that really is 1080p/4K). So we don't trust a single try: we probe
-# every client over several rounds, always keep the highest-resolution file we
-# managed to download, and pause between rounds to dodge the rate limit. Slow but
-# it gets the maximum quality "at all costs".
-YOUTUBE_QUALITY_CLIENTS = ["tv_embedded", "web_safari", "web", "android_vr", "mweb", "tv"]
-YOUTUBE_FALLBACK_CLIENTS = ["android", "ios"]
-MAX_QUALITY_ROUNDS = 4          # how many full passes over all clients
-ROUND_COOLDOWN_SECONDS = 6      # wait between rounds so YouTube stops throttling
-PER_CLIENT_PAUSE_SECONDS = 1.5  # small gap between client requests
+# We let yt-dlp extract and COMBINE the formats from every enabled player client
+# in a single pass and pick the single highest-resolution one (it does this cross-
+# client selection natively). "default" is yt-dlp's own smart client set, which
+# consumes the bgutil PO token when the Colab helper is running -- that token is
+# what unlocks 1080p/4K from Colab's datacenter IP, where the plain web client is
+# otherwise capped at 360p. tv_embedded + android_vr are robust no-token fallbacks
+# for when the PO-token helper is off. Forcing one client at a time (the old
+# approach) fought this smart selection and often lost resolution.
+YOUTUBE_PLAYER_CLIENTS = ["default", "tv_embedded", "android_vr"]
+
+# YouTube can still throttle Colab's datacenter IP mid-download and hand us a
+# lower format than it advertised, so we retry the whole download a few times,
+# keep the highest-resolution file across attempts, and pause between tries so
+# the rate limit cools down.
+MAX_DOWNLOAD_ATTEMPTS = 3
+ATTEMPT_COOLDOWN_SECONDS = 5
 
 
 @dataclass
@@ -438,8 +445,20 @@ def _max_height(formats: list[dict] | None) -> int | None:
     return top or None
 
 
-def _ydl_opts(player_clients: list[str], video_folder: Path, logger: _QuietLogger) -> dict:
-    return {
+def _find_cookies_file() -> str | None:
+    """Use a cookies.txt from the working directory if the user dropped one in.
+
+    On a YouTube-flagged Colab IP, authenticated cookies are the infallible way
+    to still get maximum quality (see the README). It is fully optional.
+    """
+    for name in ("cookies.txt", "youtube_cookies.txt"):
+        if Path(name).is_file():
+            return name
+    return None
+
+
+def _ydl_opts(video_folder: Path, logger: _QuietLogger) -> dict:
+    opts = {
         "format": YOUTUBE_FORMAT,
         "format_sort": ["res", "fps", "vcodec:h264", "br"],
         "outtmpl": str(video_folder / "video.%(ext)s"),
@@ -449,50 +468,50 @@ def _ydl_opts(player_clients: list[str], video_folder: Path, logger: _QuietLogge
         "noplaylist": True,
         "noprogress": True,
         "logger": logger,
-        "retries": 5,
-        "fragment_retries": 5,
+        "retries": 10,
+        "fragment_retries": 10,
         "extractor_retries": 3,
-        "extractor_args": {"youtube": {"player_client": player_clients}},
+        "extractor_args": {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
         "http_headers": {"User-Agent": USER_AGENT},
     }
+    cookies = _find_cookies_file()
+    if cookies:
+        opts["cookiefile"] = cookies
+    return opts
 
 
-def _probe_client_max(yt_dlp_mod, video_url: str, client: str,
-                      attempt_dir: Path, logger: _QuietLogger) -> tuple[int, str]:
-    """Ask one client which formats it can see. Returns (max_height, last_error)."""
-    try:
-        with yt_dlp_mod.YoutubeDL(_ydl_opts([client], attempt_dir, logger)) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-        return _max_height((info or {}).get("formats")) or 0, ""
-    except Exception as exc:
-        return 0, (logger.last_error or str(exc))
+def _attempt_download(yt_dlp_mod, video_url: str, attempt_dir: Path,
+                      logger: _QuietLogger) -> tuple[Path | None, int, int, str]:
+    """One full download attempt into attempt_dir.
 
-
-def _download_with_client(yt_dlp_mod, video_url: str, client: str,
-                          attempt_dir: Path, logger: _QuietLogger) -> tuple[Path | None, int, str]:
-    """Download with one client into attempt_dir. Returns (file, height, error)."""
+    yt-dlp combines the formats from every enabled player client and picks the
+    single best one, so a single attempt already chases the maximum resolution.
+    Returns (file, downloaded_height, available_height, error).
+    """
     try:
         for leftover in attempt_dir.glob("video.*"):
             leftover.unlink(missing_ok=True)
-        with yt_dlp_mod.YoutubeDL(_ydl_opts([client], attempt_dir, logger)) as ydl:
-            ydl.extract_info(video_url, download=True)
+        with yt_dlp_mod.YoutubeDL(_ydl_opts(attempt_dir, logger)) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+        available = _max_height((info or {}).get("formats")) or 0
         files = [f for f in attempt_dir.glob("video.*") if f.suffix.lower() != ".jpg"]
         if not files:
             raise RuntimeError("yt-dlp did not produce an output file.")
-        return files[0], (get_video_height(files[0]) or 0), ""
+        downloaded = get_video_height(files[0]) or (info or {}).get("height") or 0
+        return files[0], downloaded, available, ""
     except Exception as exc:
-        return None, 0, (logger.last_error or str(exc))
+        return None, 0, 0, (logger.last_error or str(exc))
 
 
 def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
-    """Download one YouTube video at the highest resolution we can actually get.
+    """Download one YouTube video at the highest resolution available.
 
-    "Max quality at all costs": YouTube throttles Colab's datacenter IP unevenly,
-    so a single try can grab only 360p of a 1080p/4K video. We therefore run
-    several rounds: each round probes every client, downloads from any client that
-    can beat the best file we already have, and always keeps the highest-resolution
-    result. Pauses between rounds let the rate limit cool down. It is slow on
-    purpose. Reports the best resolution YouTube ever exposed vs. what we got.
+    yt-dlp already extracts the formats from every enabled player client and
+    picks the single highest-resolution one in one pass, so we just run that and
+    retry the whole download a few times: YouTube can throttle Colab's datacenter
+    IP mid-download and hand us a lower format than it advertised. We keep the
+    best file across attempts and pause between tries so the rate limit cools
+    down. Reports the best resolution YouTube exposed vs. what we actually got.
     """
     video_folder.mkdir(parents=True, exist_ok=True)
     status = "failed"
@@ -515,58 +534,36 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
         }
 
     logger = _QuietLogger()
-    all_clients = YOUTUBE_QUALITY_CLIENTS + [
-        c for c in YOUTUBE_FALLBACK_CLIENTS if c not in YOUTUBE_QUALITY_CLIENTS
-    ]
     attempt_dir = video_folder / "_attempt"
     attempt_dir.mkdir(parents=True, exist_ok=True)
 
-    true_max = 0          # best resolution any client ever exposed (the real max)
+    true_max = 0          # best resolution YouTube exposed (the real max)
     best_height = 0       # best resolution we actually downloaded
     best_file: Path | None = None
 
-    for round_idx in range(MAX_QUALITY_ROUNDS):
-        max_grew = False
+    for attempt in range(MAX_DOWNLOAD_ATTEMPTS):
+        cand, cand_height, available, err = _attempt_download(
+            yt_dlp, video.url, attempt_dir, logger
+        )
+        if err:
+            error_message = err
+        if available > true_max:
+            true_max = available
+        if cand and cand_height > best_height:
+            # Promote this better file to the real folder, replacing the old one.
+            for old in video_folder.glob("video.*"):
+                if old.suffix.lower() != ".jpg":
+                    old.unlink(missing_ok=True)
+            dest = video_folder / cand.name
+            cand.replace(dest)
+            best_file, best_height = dest, cand_height
 
-        # Probe every client this round to (re)discover the true maximum.
-        probed: list[tuple[int, str]] = []
-        for client in all_clients:
-            height, err = _probe_client_max(yt_dlp, video.url, client, attempt_dir, logger)
-            if err:
-                error_message = err
-            probed.append((height, client))
-            if height > true_max:
-                true_max, max_grew = height, True
-            time.sleep(PER_CLIENT_PAUSE_SECONDS)
-
-        # Download from clients that could beat what we already have (best first).
-        for height, client in sorted(probed, reverse=True):
-            if height == 0 or height <= best_height:
-                continue
-            cand, cand_height, err = _download_with_client(
-                yt_dlp, video.url, client, attempt_dir, logger
-            )
-            if err:
-                error_message = err
-            if cand and cand_height > best_height:
-                # Promote this better file to the real folder, replacing the old one.
-                for old in video_folder.glob("video.*"):
-                    if old.suffix.lower() != ".jpg":
-                        old.unlink(missing_ok=True)
-                dest = video_folder / cand.name
-                cand.replace(dest)
-                best_file, best_height = dest, cand_height
-            time.sleep(PER_CLIENT_PAUSE_SECONDS)
-            if best_height >= true_max and best_height > 0:
-                break
-
-        # Stop early only when we are confident we already have the maximum.
         if best_height >= 2160:
-            break  # 4K — there is nothing higher to chase
-        if best_height >= true_max and best_height > 0 and not max_grew and round_idx >= 1:
-            break  # best matches the discovered max and the max stopped growing
-        if round_idx < MAX_QUALITY_ROUNDS - 1:
-            time.sleep(ROUND_COOLDOWN_SECONDS)
+            break  # 4K — nothing higher to chase
+        if best_height > 0 and best_height >= true_max:
+            break  # we already have the maximum YouTube exposed
+        if attempt < MAX_DOWNLOAD_ATTEMPTS - 1:
+            time.sleep(ATTEMPT_COOLDOWN_SECONDS)
 
     shutil.rmtree(attempt_dir, ignore_errors=True)
 

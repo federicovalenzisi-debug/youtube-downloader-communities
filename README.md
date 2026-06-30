@@ -23,13 +23,31 @@ instalar Python/FFmpeg. Todo corre en la nube de Google.
 Necesita una cuenta de Google (gratis). La primera celda tarda 1–2 minutos en preparar
 el entorno.
 
-> **Máxima calidad (1080p/4K):** desde Colab, YouTube solo entrega la alta resolución
-> si hay un *PO token*. La primera celda levanta sola un pequeño servidor que lo genera
-> (opción `MAXIMA_CALIDAD`, activada por defecto), así que no hay que hacer nada. Si ese
-> servidor no llega a iniciar, los videos igual se descargan, pero pueden bajar en baja
-> resolución (~360p). En ese caso, volvé a ejecutar la primera celda. Si cambiás el
-> notebook, acordate de **Entorno de ejecución → Desconectar y eliminar entorno** antes
-> de volver a ejecutarlo, para que Colab tome la versión nueva.
+> **Máxima calidad (1080p/4K):** desde Colab, YouTube corre sobre una IP de datacenter
+> que solo entrega alta resolución si la petición lleva un *PO token* y si hay un runtime
+> de JavaScript para resolver la firma de los formatos. La primera celda prepara las dos
+> cosas sola (opción `MAX_QUALITY`, activada por defecto):
+>
+> - instala **Deno** (runtime JS que yt-dlp necesita para destrabar 1080p/4K),
+> - instala **Node.js 20** si Colab trae uno más viejo, y
+> - levanta el servidor **bgutil** (PO token) en la versión que coincide con el plugin.
+>
+> Al terminar, la celda hace una **verificación real**: prueba un video 1080p conocido y
+> avisa con `✅` si la máxima calidad funciona, o con `⚠️` si la IP de Colab está limitada.
+> Si sale el aviso, lo más efectivo es **Entorno de ejecución → Desconectar y eliminar
+> entorno** y volver a *Ejecutar todo* (Colab te da una IP nueva). Acordate de hacer eso
+> también cada vez que cambie el notebook, para que tome la versión nueva.
+
+#### Si la IP de Colab sigue limitada (cookies)
+
+Si tras reintentar con IP nueva el aviso `⚠️` persiste, es porque esa IP quedó marcada
+por YouTube. La solución infalible es usar tus **cookies** de YouTube:
+
+1. En tu navegador, exportá las cookies de `youtube.com` a un archivo `cookies.txt`
+   (extensión "Get cookies.txt LOCALLY" o similar).
+2. Subilo a Colab (panel izquierdo → 📁 → subir) como `cookies.txt`.
+3. yt-dlp lo toma automáticamente si está en la carpeta de trabajo. Con cookies, la
+   descarga usa tu sesión y baja siempre a máxima calidad.
 
 ### Para vos (publicarlo una sola vez)
 
