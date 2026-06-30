@@ -56,12 +56,17 @@ adentro, así que el compañero no necesita nada más que ese archivo.
 
 Opción A — **GitHub (recomendada):**
 
-1. Subí esta carpeta a un repositorio de GitHub.
-2. El link de Colab se arma así (reemplazá `USUARIO/REPO` y la rama):
-   ```
-   https://colab.research.google.com/github/USUARIO/REPO/blob/main/download-youtube/YouTube_Downloader_Colab.ipynb
-   ```
-3. Pasale ese link al compañero. Listo.
+Este repo ya está publicado. El link de Colab para pasarle al compañero es:
+
+```
+https://colab.research.google.com/github/federicovalenzisi-debug/youtube-downloader-communities/blob/main/YouTube_Downloader_Colab.ipynb
+```
+
+(El notebook vive en la **raíz** del repo, por eso el path no lleva subcarpeta.) Si
+clonás esto en otro repo, el patrón general es:
+```
+https://colab.research.google.com/github/USUARIO/REPO/blob/RAMA/YouTube_Downloader_Colab.ipynb
+```
 
 > Nota: GitHub **Pages** no sirve para esto (solo publica HTML estático y no puede
 > ejecutar Python ni descargar de YouTube). Lo que se usa es GitHub como almacenamiento
