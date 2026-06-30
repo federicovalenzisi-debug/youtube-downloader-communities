@@ -40,7 +40,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 
-__version__ = "1.7"
+__version__ = "1.8"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -64,17 +64,30 @@ GENERIC_VIDEO_TITLES = {"hubspot video", "video", "watch video", "play video"}
 # client selection natively). "default" is yt-dlp's own smart client set, which
 # consumes the bgutil PO token when the Colab helper is running -- that token is
 # what unlocks 1080p/4K from Colab's datacenter IP, where the plain web client is
-# otherwise capped at 360p. tv_embedded + android_vr are robust no-token fallbacks
-# for when the PO-token helper is off. Forcing one client at a time (the old
-# approach) fought this smart selection and often lost resolution.
-YOUTUBE_PLAYER_CLIENTS = ["default", "tv_embedded", "android_vr"]
+# otherwise capped at 360p. tv_embedded + android_vr + web_safari are robust
+# fallbacks. Forcing one client at a time (the old approach) fought this smart
+# selection and often lost resolution.
+YOUTUBE_PLAYER_CLIENTS = ["default", "tv_embedded", "android_vr", "web_safari"]
 
-# YouTube can still throttle Colab's datacenter IP mid-download and hand us a
-# lower format than it advertised, so we retry the whole download a few times,
-# keep the highest-resolution file across attempts, and pause between tries so
+# If the high-quality clients all come back EMPTY (YouTube throttling Colab's IP,
+# typically right after a big 4K download exhausts the rate limit), we widen the
+# net to every client so we at least grab SOMETHING. yt-dlp still picks the
+# highest-resolution format across all of them, so this never lowers quality --
+# it only adds fallbacks for the throttled case.
+YOUTUBE_FALLBACK_PLAYER_CLIENTS = [
+    "default", "web_safari", "web", "tv_embedded", "android_vr", "mweb", "tv", "android", "ios",
+]
+
+# YouTube can throttle Colab's datacenter IP between videos and hand us a lower
+# format -- or nothing at all -- so we retry the whole download a few times, keep
+# the highest-resolution file across attempts, and back off longer each time so
 # the rate limit cools down.
-MAX_DOWNLOAD_ATTEMPTS = 3
-ATTEMPT_COOLDOWN_SECONDS = 5
+MAX_DOWNLOAD_ATTEMPTS = 4
+ATTEMPT_COOLDOWN_SECONDS = 8
+
+# Small pause between videos so a big download doesn't leave the IP "hot" and get
+# the next video throttled. Only meaningful on Colab; negligible locally.
+INTER_VIDEO_PAUSE_SECONDS = 3
 
 
 @dataclass
@@ -421,19 +434,31 @@ class _QuietLogger:
 
 
 def _clean_error(message: str) -> str:
-    """Shorten a yt-dlp error into something a non-technical user can read."""
+    """Shorten a yt-dlp error into something a non-technical user can read.
+
+    Order matters: the specific causes are checked BEFORE the generic phrases.
+    In particular 'requested format is not available' contains 'not available',
+    so it must be matched first or a throttling problem gets mislabeled as the
+    video being gone.
+    """
     text = re.sub(r"\x1b\[[0-9;]*m", "", message or "").strip()
     text = re.sub(r"^ERROR:\s*", "", text)
     lowered = text.lower()
-    if "not available" in lowered or "video unavailable" in lowered:
-        return "the video is no longer available on YouTube"
+    if "sign in to confirm" in lowered or "not a bot" in lowered:
+        return "YouTube is rate-limiting this IP (it asked to confirm you're not a bot) -- retry with a fresh runtime or use cookies"
+    if "requested format is not available" in lowered:
+        return "YouTube served no downloadable format (usually IP rate-limiting) -- retry with a fresh runtime or use cookies"
     if "private" in lowered:
         return "the video is private"
+    if "members-only" in lowered or "join this channel" in lowered:
+        return "the video is members-only"
+    if "age" in lowered and ("confirm" in lowered or "restrict" in lowered or "sign in" in lowered):
+        return "the video is age-restricted (needs cookies)"
+    if "video unavailable" in lowered or "no longer available" in lowered or "has been removed" in lowered or "been terminated" in lowered:
+        return "the video is no longer available on YouTube"
     if "403" in lowered or "forbidden" in lowered:
         return "YouTube blocked the download (try again)"
-    if "requested format is not available" in lowered:
-        return "no downloadable format was found"
-    return text[:140] if text else "unknown error"
+    return text[:160] if text else "unknown error"
 
 
 def _max_height(formats: list[dict] | None) -> int | None:
@@ -457,7 +482,7 @@ def _find_cookies_file() -> str | None:
     return None
 
 
-def _ydl_opts(video_folder: Path, logger: _QuietLogger) -> dict:
+def _ydl_opts(video_folder: Path, logger: _QuietLogger, player_clients: list[str]) -> dict:
     opts = {
         "format": YOUTUBE_FORMAT,
         "format_sort": ["res", "fps", "vcodec:h264", "br"],
@@ -471,7 +496,7 @@ def _ydl_opts(video_folder: Path, logger: _QuietLogger) -> dict:
         "retries": 10,
         "fragment_retries": 10,
         "extractor_retries": 3,
-        "extractor_args": {"youtube": {"player_client": YOUTUBE_PLAYER_CLIENTS}},
+        "extractor_args": {"youtube": {"player_client": player_clients}},
         "http_headers": {"User-Agent": USER_AGENT},
     }
     cookies = _find_cookies_file()
@@ -481,8 +506,8 @@ def _ydl_opts(video_folder: Path, logger: _QuietLogger) -> dict:
 
 
 def _attempt_download(yt_dlp_mod, video_url: str, attempt_dir: Path,
-                      logger: _QuietLogger) -> tuple[Path | None, int, int, str]:
-    """One full download attempt into attempt_dir.
+                      logger: _QuietLogger, player_clients: list[str]) -> tuple[Path | None, int, int, str]:
+    """One full download attempt into attempt_dir with the given player clients.
 
     yt-dlp combines the formats from every enabled player client and picks the
     single best one, so a single attempt already chases the maximum resolution.
@@ -491,7 +516,7 @@ def _attempt_download(yt_dlp_mod, video_url: str, attempt_dir: Path,
     try:
         for leftover in attempt_dir.glob("video.*"):
             leftover.unlink(missing_ok=True)
-        with yt_dlp_mod.YoutubeDL(_ydl_opts(attempt_dir, logger)) as ydl:
+        with yt_dlp_mod.YoutubeDL(_ydl_opts(attempt_dir, logger, player_clients)) as ydl:
             info = ydl.extract_info(video_url, download=True)
         available = _max_height((info or {}).get("formats")) or 0
         files = [f for f in attempt_dir.glob("video.*") if f.suffix.lower() != ".jpg"]
@@ -542,8 +567,16 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
     best_file: Path | None = None
 
     for attempt in range(MAX_DOWNLOAD_ATTEMPTS):
+        # Start with the high-quality clients. If we still have nothing after the
+        # first try (IP throttled), widen to every client to grab at least
+        # something -- yt-dlp keeps picking the best format, so quality is safe.
+        clients = (
+            YOUTUBE_PLAYER_CLIENTS
+            if (attempt == 0 or best_height > 0)
+            else YOUTUBE_FALLBACK_PLAYER_CLIENTS
+        )
         cand, cand_height, available, err = _attempt_download(
-            yt_dlp, video.url, attempt_dir, logger
+            yt_dlp, video.url, attempt_dir, logger, clients
         )
         if err:
             error_message = err
@@ -563,7 +596,8 @@ def download_youtube_video(video: VideoCandidate, video_folder: Path) -> dict:
         if best_height > 0 and best_height >= true_max:
             break  # we already have the maximum YouTube exposed
         if attempt < MAX_DOWNLOAD_ATTEMPTS - 1:
-            time.sleep(ATTEMPT_COOLDOWN_SECONDS)
+            # Back off longer each attempt so YouTube's rate limit cools down.
+            time.sleep(ATTEMPT_COOLDOWN_SECONDS * (attempt + 1))
 
     shutil.rmtree(attempt_dir, ignore_errors=True)
 
@@ -776,7 +810,10 @@ def process_community(
                 "screenshot_error": screenshot["error"],
             }
         )
-        time.sleep(0.1)
+        # Let the IP cool between videos so a big download doesn't get the next
+        # one throttled (matters on Colab; negligible locally). Skip after last.
+        if index < len(all_videos):
+            time.sleep(INTER_VIDEO_PAUSE_SECONDS)
 
     write_community_manifest(community_folder, result.rows)
     return result
